@@ -1,0 +1,8 @@
+;; A 4x4 grid pattern (Nagpal thesis section 3.2.2). Just creases, no folds.
+
+(define h1 (crease-l2l e34 e12))
+(define h2 (crease-l2l h1 e12))
+(define h3 (crease-l2l h1 e34))
+(define v1 (crease-l2l e23 e14))
+(define v2 (crease-l2l v1 e23))
+(define v3 (crease-l2l v1 e14))

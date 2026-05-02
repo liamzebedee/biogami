@@ -1,0 +1,18 @@
+;; OSL Airplane (Nagpal thesis Fig 3-5).
+
+(define cntr-line (crease-l2l e14 e23))
+(define rside (create-region c2 cntr-line))
+(define lside (create-region c1 cntr-line))
+
+(defun (fold-wing cntrline topline ucorner side dcorner)
+  (define t2 (crease-l2l topline cntrline))
+  (execute-fold t2 apical landmark=ucorner)
+  (define t3 (crease-l2l t2 cntrline))
+  (define p3 (intersect t2 side))
+  (execute-fold t3 apical landmark=p3)
+  (define t4 (crease-l2l t3 cntrline))
+  (execute-fold t4 apical landmark=dcorner))
+
+(within-region rside (fold-wing cntr-line e12 c2 e23 c3))
+(within-region lside (fold-wing cntr-line e12 c1 e14 c4))
+(execute-fold cntr-line basal landmark=c4)

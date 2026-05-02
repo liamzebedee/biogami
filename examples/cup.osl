@@ -1,0 +1,22 @@
+;; OSL Cup program (Nagpal thesis Fig 3-4)
+;; A square sheet folded into a cup. Demonstrates regions and partial-layer folds.
+
+(define d1 (crease-p2p c3 c1))
+(define front (create-region c3 d1))
+(define back  (create-region c1 d1))
+(execute-fold d1 apical landmark=c3)
+
+(define d2 (crease-l2l e23 d1))
+(define p1 (intersect d2 e34))
+(define d3 (crease-p2p c2 p1))
+(execute-fold d3 apical landmark=c2)
+
+(define p2 (intersect d3 e23))
+(define d4 (crease-p2p c4 p2))
+(execute-fold d4 apical landmark=c4)
+
+(define l1 (crease-lbp p1 p2))
+(within-region front
+  (execute-fold l1 apical landmark=c3))
+(within-region back
+  (execute-fold l1 basal landmark=c1))
