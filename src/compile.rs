@@ -1,12 +1,13 @@
-//! Compiler: OSL program → cell program. Each OSL operation becomes a call to
-//! the corresponding cell-program rule (axiom1-rule, axiom2-rule, intersect-rule,
-//! create-region-rule, execute-fold-rule). Gradient names are allocated per op
-//! per the thesis (3 gradients per axiom; reusable after a fold via `flush`).
+//! Compiler: OSL program → cell program. Each OSL operation becomes a call
+//! to the corresponding cell-program rule (axiom1-rule, axiom2-rule,
+//! intersect-rule, create-region-rule, execute-fold-rule). Gradient names
+//! are allocated per op per the thesis (3 gradients per axiom; reusable
+//! after a fold via `flush`).
 //!
-//! The cell program is itself a Lisp-flavoured s-expression, ready to be run
-//! by the cell simulator (see `cellsim.rs` driver in `interp.rs::run_cell`).
+//! Each compiled op carries the OSL source line it came from so the GUI can
+//! highlight that line while the op runs.
 
-use crate::ast::Expr;
+use crate::ast::{Expr, TopForm};
 use anyhow::{anyhow, bail, Result};
 
 pub struct Compiler {
@@ -15,27 +16,53 @@ pub struct Compiler {
 }
 
 #[derive(Debug, Clone)]
+pub struct CellOp {
+    /// Source line in the OSL program that this op was compiled from.
+    pub global_line: usize,
+    /// The lowered s-expression executed by the cell-program runner.
+    pub expr: Expr,
+}
+
+#[derive(Debug, Clone)]
 pub struct CellProgram {
-    /// Local boolean state vars (from defines). The cell already has e12-e41,
-    /// c1-c4 implicitly.
+    /// Local boolean state vars (from defines). Cells already have e12-e41
+    /// and c1-c4 implicitly.
     pub state_vars: Vec<String>,
-    /// Lowered s-expressions, executed sequentially.
-    pub ops: Vec<Expr>,
+    pub ops: Vec<CellOp>,
 }
 
 impl CellProgram {
-    pub fn to_source(&self) -> String {
+    /// Render the cell program as Lisp text. Returns the full source plus a
+    /// per-op mapping `op_index → 1-indexed line in the rendered text` so
+    /// the GUI can highlight the running line.
+    pub fn render(&self) -> (String, Vec<usize>) {
         let mut out = String::new();
-        out.push_str(";; CELL PROGRAM\n");
-        out.push_str(";; initial state: e12-e41, c1-c4, current-region=#t\n");
+        let mut op_line = Vec::with_capacity(self.ops.len());
+        let mut line: usize = 1;
+        let push = |out: &mut String, line: &mut usize, s: &str| {
+            out.push_str(s);
+            out.push('\n');
+            *line += 1;
+        };
+        push(&mut out, &mut line, ";; CELL PROGRAM");
+        push(
+            &mut out,
+            &mut line,
+            ";; initial state: e12-e41, c1-c4, current-region=#t",
+        );
         for v in &self.state_vars {
-            out.push_str(&format!("(define {} #f)\n", v));
+            push(&mut out, &mut line, &format!("(define {} #f)", v));
         }
-        out.push_str("(set! local-delay (calibrate))\n");
+        push(&mut out, &mut line, "(set! local-delay (calibrate))");
         for op in &self.ops {
-            out.push_str(&format!("{}\n", op));
+            op_line.push(line);
+            push(&mut out, &mut line, &format!("{}", op.expr));
         }
-        out
+        (out, op_line)
+    }
+
+    pub fn to_source(&self) -> String {
+        self.render().0
     }
 }
 
@@ -59,20 +86,21 @@ impl Compiler {
         format!("t{}", n)
     }
 
-    pub fn compile(&mut self, program: &[Expr]) -> Result<CellProgram> {
+    pub fn compile(&mut self, program: &[TopForm]) -> Result<CellProgram> {
         let mut state_vars = Vec::new();
         let mut ops = Vec::new();
-        for e in program {
-            self.compile_top(e, &mut state_vars, &mut ops)?;
+        for f in program {
+            self.compile_top(f.line, &f.expr, &mut state_vars, &mut ops)?;
         }
         Ok(CellProgram { state_vars, ops })
     }
 
     fn compile_top(
         &mut self,
+        line: usize,
         e: &Expr,
         state: &mut Vec<String>,
-        ops: &mut Vec<Expr>,
+        ops: &mut Vec<CellOp>,
     ) -> Result<()> {
         let xs = e
             .as_list()
@@ -87,18 +115,22 @@ impl Compiler {
                     .ok_or_else(|| anyhow!("compiler: define name"))?
                     .to_string();
                 state.push(name.clone());
-                let rhs = self.compile_op(&xs[2], &name)?;
-                ops.push(set_call(&name, rhs));
+                let rhs = self.compile_op(&xs[2])?;
+                ops.push(CellOp {
+                    global_line: line,
+                    expr: set_call(&name, rhs),
+                });
                 Ok(())
             }
             "defun" => {
-                // Inline expansion at call sites — we don't emit cell-level fns.
-                // Store the body for later expansion.
-                bail!("compiler: defun must be expanded prior to compile (not yet supported)");
+                bail!("compiler: defun must be expanded before compile (use expand_defuns)");
             }
             "execute-fold" => {
                 let op = self.compile_execute_fold(xs)?;
-                ops.push(op);
+                ops.push(CellOp {
+                    global_line: line,
+                    expr: op,
+                });
                 Ok(())
             }
             "within-region" => {
@@ -106,25 +138,36 @@ impl Compiler {
                     .as_symbol()
                     .ok_or_else(|| anyhow!("compiler: within-region region must be a symbol"))?
                     .to_string();
-                ops.push(set_call("current-region", Expr::sym(&region)));
+                ops.push(CellOp {
+                    global_line: line,
+                    expr: set_call("current-region", Expr::sym(&region)),
+                });
                 for body in &xs[2..] {
-                    self.compile_top(body, state, ops)?;
+                    // Body forms inherit the within-region call site's line —
+                    // by the time defuns are expanded the caller's line is
+                    // already attached to each form, so this branch only
+                    // matters for raw within-region children.
+                    self.compile_top(line, body, state, ops)?;
                 }
-                ops.push(set_call("current-region", Expr::Bool(true)));
+                ops.push(CellOp {
+                    global_line: line,
+                    expr: set_call("current-region", Expr::Bool(true)),
+                });
                 Ok(())
             }
             other => bail!("compiler: unsupported top-level form: {}", other),
         }
     }
 
-    fn compile_op(&mut self, e: &Expr, dst: &str) -> Result<Expr> {
-        let xs = e.as_list().ok_or_else(|| anyhow!("compiler: op must be a list"))?;
+    fn compile_op(&mut self, e: &Expr) -> Result<Expr> {
+        let xs = e
+            .as_list()
+            .ok_or_else(|| anyhow!("compiler: op must be a list"))?;
         let head = xs[0]
             .as_symbol()
             .ok_or_else(|| anyhow!("compiler: op head"))?;
         match head {
             "crease-lbp" | "crease-l2s" => {
-                // axiom1-rule p1 p2 gstart gend
                 let p1 = symbol_or_err(&xs[1])?;
                 let p2 = symbol_or_err(&xs[2])?;
                 let g1 = self.fresh_grad();
@@ -138,7 +181,6 @@ impl Compiler {
                 ]))
             }
             "crease-p2p" | "crease-l2l" => {
-                // axiom2-rule p1 p2 g1 g2 gend
                 let p1 = symbol_or_err(&xs[1])?;
                 let p2 = symbol_or_err(&xs[2])?;
                 let g1 = self.fresh_grad();
@@ -167,7 +209,6 @@ impl Compiler {
                 let l1 = symbol_or_err(&xs[2])?;
                 let gbound = self.fresh_grad();
                 let gend = self.fresh_grad();
-                let _ = dst;
                 Ok(Expr::list(vec![
                     Expr::sym("create-region-rule"),
                     Expr::sym(&p1),
@@ -181,10 +222,8 @@ impl Compiler {
     }
 
     fn compile_execute_fold(&mut self, xs: &[Expr]) -> Result<Expr> {
-        // (execute-fold line type landmark=p)
         let line = symbol_or_err(&xs[1])?;
         let typ = symbol_or_err(&xs[2])?;
-        // landmark
         let landmark = xs
             .iter()
             .skip(3)
@@ -218,15 +257,16 @@ fn symbol_or_err(e: &Expr) -> Result<String> {
         .ok_or_else(|| anyhow!("compiler: expected symbol"))
 }
 
-/// Expand `(defun (name args...) body...)` calls inline so the compiler sees a
-/// flat sequence of OSL operations. Returns the expanded program.
-pub fn expand_defuns(program: &[Expr]) -> Result<Vec<Expr>> {
+/// Inline `(defun (name args...) body...)` calls. Each inlined body form
+/// keeps the *call site's* line so the GUI highlight stays at the user's
+/// view of the program rather than jumping inside a procedure body.
+pub fn expand_defuns(program: &[TopForm]) -> Result<Vec<TopForm>> {
     use std::collections::HashMap;
     let mut funcs: HashMap<String, (Vec<String>, Vec<Expr>)> = HashMap::new();
     let mut out = Vec::new();
-    for e in program {
-        if let Some("defun") = e.head_symbol() {
-            let xs = e.as_list().unwrap();
+    for f in program {
+        if let Some("defun") = f.expr.head_symbol() {
+            let xs = f.expr.as_list().unwrap();
             let header = xs[1]
                 .as_list()
                 .ok_or_else(|| anyhow!("defun: header"))?;
@@ -246,11 +286,18 @@ pub fn expand_defuns(program: &[Expr]) -> Result<Vec<Expr>> {
             funcs.insert(name, (params, body));
             continue;
         }
-        out.push(expand_calls(e, &funcs)?);
+        // Expand calls in this form, then flatten any (begin ...) the
+        // expansion may have introduced into separate top-level forms
+        // (still tagged with the original call-site line).
+        let expanded = expand_calls(&f.expr, &funcs)?;
+        for e in flatten_top(expanded) {
+            out.push(TopForm {
+                line: f.line,
+                expr: e,
+            });
+        }
     }
-    // Defuns introduce nested calls; flatten any block that ended up as a list
-    // of statements (we wrap inlined bodies in `begin`).
-    Ok(flatten_begin(out))
+    Ok(out)
 }
 
 fn expand_calls(
@@ -301,20 +348,17 @@ fn substitute(e: &Expr, bindings: &std::collections::HashMap<String, Expr>) -> E
     }
 }
 
-fn flatten_begin(stmts: Vec<Expr>) -> Vec<Expr> {
-    let mut out = Vec::new();
-    for s in stmts {
-        if let Expr::List(xs) = &s {
-            if xs.first().and_then(|e| e.as_symbol()) == Some("begin") {
-                for c in xs.iter().skip(1).cloned() {
-                    out.extend(flatten_begin(vec![c]));
-                }
-                continue;
+fn flatten_top(e: Expr) -> Vec<Expr> {
+    if let Expr::List(xs) = &e {
+        if xs.first().and_then(|e| e.as_symbol()) == Some("begin") {
+            let mut out = Vec::new();
+            for c in xs.iter().skip(1).cloned() {
+                out.extend(flatten_top(c));
             }
+            return out;
         }
-        out.push(s);
     }
-    out
+    vec![e]
 }
 
 #[cfg(test)]
@@ -340,7 +384,18 @@ mod tests {
         let src = include_str!("../examples/airplane.osl");
         let prog = parse(src).unwrap();
         let expanded = expand_defuns(&prog).unwrap();
-        // After expansion there should be no `defun` left.
-        assert!(expanded.iter().all(|e| e.head_symbol() != Some("defun")));
+        assert!(expanded.iter().all(|f| f.expr.head_symbol() != Some("defun")));
+    }
+
+    #[test]
+    fn ops_track_global_line() {
+        let src = "(define a (crease-p2p c1 c2))\n(execute-fold a apical landmark=c1)";
+        let prog = parse(src).unwrap();
+        let expanded = expand_defuns(&prog).unwrap();
+        let mut c = Compiler::new();
+        let cp = c.compile(&expanded).unwrap();
+        // First op (the axiom2-rule) was on OSL line 1, the fold on line 2.
+        assert_eq!(cp.ops[0].global_line, 1);
+        assert_eq!(cp.ops[1].global_line, 2);
     }
 }

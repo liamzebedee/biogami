@@ -2,7 +2,7 @@
 //! geometry: axioms produce real lines, execute-fold reflects polygons across
 //! lines. Output is a (crease pattern, layered sheet) pair.
 
-use crate::ast::Expr;
+use crate::ast::{Expr, TopForm};
 use crate::geom::{
     crease_l2l, crease_l2s, crease_lbp, crease_p2p, intersect_lines, Line, Vec2,
 };
@@ -104,9 +104,9 @@ impl Interp {
         }
     }
 
-    pub fn run(&mut self, program: &[Expr]) -> Result<()> {
-        for e in program {
-            self.eval(e)?;
+    pub fn run(&mut self, program: &[TopForm]) -> Result<()> {
+        for f in program {
+            self.eval(&f.expr)?;
         }
         Ok(())
     }

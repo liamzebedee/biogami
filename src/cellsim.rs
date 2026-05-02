@@ -17,9 +17,11 @@ use rand::Rng;
 use rand_chacha::ChaCha8Rng;
 use std::collections::HashMap;
 
-/// Per-layer z offset in the 3D view, in sheet units. Each fold pushes the
-/// moving side this far above (apical) or below (basal) the stationary side.
-pub const STACK_EPS: f64 = 0.012;
+/// Default per-fold z offset, in sheet units. Real flat-folded paper has its
+/// layers touching (0); a small positive value spreads the stack visibly so
+/// you can read the layered structure as a 3D shape. Configurable via
+/// `Runner.stack_eps`.
+pub const STACK_EPS: f64 = 0.015;
 
 #[derive(Debug, Clone)]
 pub struct Cell {
@@ -65,8 +67,14 @@ pub struct Cell {
 
     /// 3D rendering position. Used by both the 3D view and the fold
     /// animation. At rest equals `(display_pos.x, display_pos.y,
-    /// layer * STACK_EPS * fold_sign)`. Substrate-only.
+    /// fold_z_units * stack_eps)`. Substrate-only.
     pub pos_3d: Vec3,
+
+    /// Signed cumulative count of folds this cell has been the moving side
+    /// of (apical = +1, basal = -1). z = fold_z_units * stack_eps. Tracked
+    /// so we can recompute the visual stack when `stack_eps` is changed at
+    /// runtime without losing per-cell direction.
+    pub fold_z_units: i32,
 }
 
 #[derive(Debug, Clone)]
@@ -130,6 +138,7 @@ impl CellSheet {
                     gradients: HashMap::new(),
                     polarity_flipped: false,
                     layer: 0,
+                    fold_z_units: 0,
                 });
             }
         }
@@ -287,16 +296,16 @@ impl CellSheet {
         }
     }
 
-    /// Execute fold along a crease line. Returns the geometry of the fold
-    /// (line + landmark + moving cell indices + post-fold positions) so the
-    /// caller can drive an animation. Geometric state (display_pos, layer,
-    /// polarity, sheet polygons) is updated synchronously.
+    /// Execute fold along a crease line. `stack_eps` is the per-fold visual
+    /// z offset used for layer stacking in the 3D view. Returns the geometry
+    /// of the fold so the caller can drive an animation.
     pub fn run_execute_fold(
         &mut self,
         crease_var: &str,
         fold: FoldType,
         landmark_var: &str,
         region_var: Option<&str>,
+        stack_eps: f64,
     ) -> Option<FoldGeom> {
         let (line, landmark) = match (
             best_fit_line(&self.cells, crease_var),
@@ -312,9 +321,9 @@ impl CellSheet {
         let mut moving = Vec::new();
         let mut start_3d = Vec::new();
         let mut end_3d = Vec::new();
-        let z_sign: f64 = match fold {
-            FoldType::Apical => 1.0,
-            FoldType::Basal => -1.0,
+        let z_delta_units: i32 = match fold {
+            FoldType::Apical => 1,
+            FoldType::Basal => -1,
         };
         for (i, c) in self.cells.iter_mut().enumerate() {
             if let Some(rv) = region_var {
@@ -328,7 +337,8 @@ impl CellSheet {
                 c.display_pos = line.reflect(c.display_pos);
                 c.polarity_flipped = !c.polarity_flipped;
                 c.layer += 1;
-                let new_z = c.layer as f64 * STACK_EPS * z_sign;
+                c.fold_z_units += z_delta_units;
+                let new_z = c.fold_z_units as f64 * stack_eps;
                 let e0 = Vec3::from_xy(c.display_pos, new_z);
                 c.pos_3d = e0;
                 moving.push(i);
@@ -444,6 +454,7 @@ fn color_for(name: &str) -> &'static str {
 // ---------- Cell program runner ----------
 
 use crate::ast::Expr;
+use crate::compile::CellOp;
 use anyhow::{anyhow, bail, Result};
 
 /// Drives a CellSheet from the compiled cell program. Multi-phase: each
@@ -452,7 +463,7 @@ use anyhow::{anyhow, bail, Result};
 /// crease appears.
 pub struct Runner {
     pub cells: CellSheet,
-    pub ops: Vec<Expr>,
+    pub ops: Vec<CellOp>,
     pub pc: usize,
     pub phase: usize,
     pub current_region: Option<String>,
@@ -463,6 +474,28 @@ pub struct Runner {
     /// Default fold animation duration in seconds. Set by the UI; the CLI sets
     /// this to 0 to disable animation.
     pub fold_duration: f32,
+    /// Per-fold visual z offset in the 3D view. `Runner::set_stack_eps`
+    /// rescales already-folded cells when this changes at runtime.
+    pub stack_eps: f64,
+    /// Snapshot history for the time-travel debugger. Each entry is the
+    /// runner state *before* the corresponding step() call. Set by the UI.
+    pub history: Vec<Snapshot>,
+    pub history_enabled: bool,
+}
+
+/// Captured runner state for one step of step-back history.
+#[derive(Clone)]
+pub struct Snapshot {
+    pub cells: Vec<Cell>,
+    pub last_gradient: Option<(String, Vec<Option<f64>>)>,
+    pub sheet: Sheet,
+    pub pc: usize,
+    pub phase: usize,
+    pub current_region: Option<String>,
+    pub last_message: String,
+    pub g1_buf: Option<Vec<Option<f64>>>,
+    pub g2_buf: Option<Vec<Option<f64>>>,
+    pub anim: Option<FoldAnim>,
 }
 
 /// Active fold animation. The Runner holds Some(_) of these from the moment a
@@ -481,7 +514,7 @@ pub struct FoldAnim {
 }
 
 impl Runner {
-    pub fn new(cells: CellSheet, ops: Vec<Expr>) -> Self {
+    pub fn new(cells: CellSheet, ops: Vec<CellOp>) -> Self {
         Runner {
             cells,
             ops,
@@ -493,11 +526,73 @@ impl Runner {
             g2_buf: None,
             anim: None,
             fold_duration: 0.3,
+            stack_eps: STACK_EPS,
+            history: Vec::new(),
+            history_enabled: false,
+        }
+    }
+
+    /// Update the per-fold visual z offset, rescaling already-folded cells so
+    /// each one's z = `fold_z_units * stack_eps`.
+    pub fn set_stack_eps(&mut self, new_eps: f64) {
+        self.stack_eps = new_eps;
+        if self.in_transition() {
+            // Don't disturb cells currently being animated; tick will keep
+            // overwriting their z this frame anyway.
+            return;
+        }
+        for c in &mut self.cells.cells {
+            c.pos_3d.z = c.fold_z_units as f64 * new_eps;
         }
     }
 
     pub fn in_transition(&self) -> bool {
         self.anim.is_some()
+    }
+
+    /// OSL line of the op currently being executed (1-indexed). None when
+    /// the program has finished.
+    pub fn current_global_line(&self) -> Option<usize> {
+        self.ops.get(self.pc).map(|o| o.global_line)
+    }
+
+    fn snapshot(&self) -> Snapshot {
+        Snapshot {
+            cells: self.cells.cells.clone(),
+            last_gradient: self.cells.last_gradient.clone(),
+            sheet: self.cells.sheet.clone(),
+            pc: self.pc,
+            phase: self.phase,
+            current_region: self.current_region.clone(),
+            last_message: self.last_message.clone(),
+            g1_buf: self.g1_buf.clone(),
+            g2_buf: self.g2_buf.clone(),
+            anim: self.anim.clone(),
+        }
+    }
+
+    fn restore(&mut self, s: Snapshot) {
+        self.cells.cells = s.cells;
+        self.cells.last_gradient = s.last_gradient;
+        self.cells.sheet = s.sheet;
+        self.pc = s.pc;
+        self.phase = s.phase;
+        self.current_region = s.current_region;
+        self.last_message = s.last_message;
+        self.g1_buf = s.g1_buf;
+        self.g2_buf = s.g2_buf;
+        self.anim = s.anim;
+    }
+
+    /// Roll back to the state before the most recent step(). Returns true if
+    /// a step was undone.
+    pub fn step_back(&mut self) -> bool {
+        if let Some(s) = self.history.pop() {
+            self.restore(s);
+            true
+        } else {
+            false
+        }
     }
 
     /// Advance an active fold animation by `dt` seconds. Returns true if the
@@ -547,7 +642,11 @@ impl Runner {
         if self.done() || self.in_transition() {
             return Ok(());
         }
-        let op = self.ops[self.pc].clone();
+        if self.history_enabled {
+            let snap = self.snapshot();
+            self.history.push(snap);
+        }
+        let op = self.ops[self.pc].expr.clone();
         let advanced = self.exec_phase(&op)?;
         if advanced {
             self.pc += 1;
@@ -767,9 +866,13 @@ impl Runner {
                         .unwrap_or_default()
                 );
                 let region = self.current_region.clone();
-                let geom = self
-                    .cells
-                    .run_execute_fold(&line, fold, &landmark, region.as_deref());
+                let geom = self.cells.run_execute_fold(
+                    &line,
+                    fold,
+                    &landmark,
+                    region.as_deref(),
+                    self.stack_eps,
+                );
                 self.cells.last_gradient = None;
                 if let Some(g) = geom {
                     if !g.moving.is_empty() {

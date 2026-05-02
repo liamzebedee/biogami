@@ -1,5 +1,14 @@
 use std::fmt;
 
+/// A top-level form parsed from OSL source. Carries the (1-indexed) source
+/// line where the form started, so the GUI can highlight the running line in
+/// both the OSL and the compiled cell program.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TopForm {
+    pub line: usize,
+    pub expr: Expr,
+}
+
 #[derive(Debug, Clone, PartialEq)]
 pub enum Expr {
     Nil,

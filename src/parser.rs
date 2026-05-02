@@ -1,8 +1,8 @@
-use crate::ast::Expr;
+use crate::ast::{Expr, TopForm};
 use anyhow::{anyhow, bail, Result};
 
 #[derive(Debug, Clone, PartialEq)]
-enum Tok {
+enum TokKind {
     LParen,
     RParen,
     Quote,
@@ -10,12 +10,23 @@ enum Tok {
     Str(String),
 }
 
+#[derive(Debug, Clone, PartialEq)]
+struct Tok {
+    kind: TokKind,
+    line: usize,
+}
+
 fn tokenize(src: &str) -> Result<Vec<Tok>> {
     let mut out = Vec::new();
     let mut chars = src.chars().peekable();
+    let mut line: usize = 1;
     while let Some(&c) = chars.peek() {
         match c {
-            ' ' | '\t' | '\n' | '\r' | ',' => {
+            '\n' => {
+                chars.next();
+                line += 1;
+            }
+            ' ' | '\t' | '\r' | ',' => {
                 chars.next();
             }
             ';' => {
@@ -28,15 +39,24 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
             }
             '(' => {
                 chars.next();
-                out.push(Tok::LParen);
+                out.push(Tok {
+                    kind: TokKind::LParen,
+                    line,
+                });
             }
             ')' => {
                 chars.next();
-                out.push(Tok::RParen);
+                out.push(Tok {
+                    kind: TokKind::RParen,
+                    line,
+                });
             }
             '\'' => {
                 chars.next();
-                out.push(Tok::Quote);
+                out.push(Tok {
+                    kind: TokKind::Quote,
+                    line,
+                });
             }
             '"' => {
                 chars.next();
@@ -58,12 +78,19 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                             }
                         }
                     } else {
+                        if c == '\n' {
+                            line += 1;
+                        }
                         s.push(c);
                     }
                 }
-                out.push(Tok::Str(s));
+                out.push(Tok {
+                    kind: TokKind::Str(s),
+                    line,
+                });
             }
             _ => {
+                let start_line = line;
                 let mut s = String::new();
                 while let Some(&c) = chars.peek() {
                     if c.is_whitespace() || c == '(' || c == ')' || c == ';' || c == '\'' {
@@ -75,7 +102,10 @@ fn tokenize(src: &str) -> Result<Vec<Tok>> {
                 if s.is_empty() {
                     return Err(anyhow!("unexpected character"));
                 }
-                out.push(Tok::Atom(s));
+                out.push(Tok {
+                    kind: TokKind::Atom(s),
+                    line: start_line,
+                });
             }
         }
     }
@@ -110,11 +140,11 @@ fn parse_one(toks: &[Tok], i: &mut usize) -> Result<Expr> {
         .ok_or_else(|| anyhow!("unexpected end of input"))?
         .clone();
     *i += 1;
-    match t {
-        Tok::LParen => {
+    match t.kind {
+        TokKind::LParen => {
             let mut items = Vec::new();
             while let Some(t) = toks.get(*i) {
-                if matches!(t, Tok::RParen) {
+                if matches!(t.kind, TokKind::RParen) {
                     *i += 1;
                     return Ok(Expr::List(items));
                 }
@@ -122,22 +152,26 @@ fn parse_one(toks: &[Tok], i: &mut usize) -> Result<Expr> {
             }
             bail!("missing closing paren");
         }
-        Tok::RParen => bail!("unexpected ')'"),
-        Tok::Quote => {
+        TokKind::RParen => bail!("unexpected ')'"),
+        TokKind::Quote => {
             let inner = parse_one(toks, i)?;
             Ok(Expr::Quoted(Box::new(inner)))
         }
-        Tok::Atom(s) => Ok(parse_atom(&s)),
-        Tok::Str(s) => Ok(Expr::Str(s)),
+        TokKind::Atom(s) => Ok(parse_atom(&s)),
+        TokKind::Str(s) => Ok(Expr::Str(s)),
     }
 }
 
-pub fn parse(src: &str) -> Result<Vec<Expr>> {
+/// Parse a complete OSL program. Returns each top-level form along with the
+/// source line where it began.
+pub fn parse(src: &str) -> Result<Vec<TopForm>> {
     let toks = tokenize(src)?;
     let mut i = 0;
     let mut out = Vec::new();
     while i < toks.len() {
-        out.push(parse_one(&toks, &mut i)?);
+        let line = toks[i].line;
+        let expr = parse_one(&toks, &mut i)?;
+        out.push(TopForm { line, expr });
     }
     Ok(out)
 }
@@ -148,28 +182,39 @@ mod tests {
 
     #[test]
     fn parses_define() {
-        let exprs = parse("(define d1 (crease-p2p c3 c1))").unwrap();
-        assert_eq!(exprs.len(), 1);
-        assert_eq!(exprs[0].head_symbol(), Some("define"));
+        let forms = parse("(define d1 (crease-p2p c3 c1))").unwrap();
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0].expr.head_symbol(), Some("define"));
+        assert_eq!(forms[0].line, 1);
     }
 
     #[test]
     fn parses_keyword_arg() {
-        let exprs = parse("(execute-fold d1 apical landmark=c3)").unwrap();
-        let xs = exprs[0].as_list().unwrap();
+        let forms = parse("(execute-fold d1 apical landmark=c3)").unwrap();
+        let xs = forms[0].expr.as_list().unwrap();
         assert!(matches!(&xs[3], Expr::Keyword(k, _) if k == "landmark"));
     }
 
     #[test]
     fn parses_comments_and_bools() {
-        let exprs = parse("; hi\n(define x #t)").unwrap();
-        assert_eq!(exprs.len(), 1);
+        let forms = parse("; hi\n(define x #t)").unwrap();
+        assert_eq!(forms.len(), 1);
+        assert_eq!(forms[0].line, 2);
     }
 
     #[test]
     fn parses_defun() {
         let src = "(defun (fold-wing a b)\n  (define t (crease-l2l a b))\n  (execute-fold t apical landmark=b))";
-        let exprs = parse(src).unwrap();
-        assert_eq!(exprs[0].head_symbol(), Some("defun"));
+        let forms = parse(src).unwrap();
+        assert_eq!(forms[0].expr.head_symbol(), Some("defun"));
+        assert_eq!(forms[0].line, 1);
+    }
+
+    #[test]
+    fn lines_track_through_blank_lines() {
+        let src = "(define a 1)\n\n\n(define b 2)";
+        let forms = parse(src).unwrap();
+        assert_eq!(forms[0].line, 1);
+        assert_eq!(forms[1].line, 4);
     }
 }
