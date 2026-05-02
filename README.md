@@ -1,5 +1,7 @@
 # biogami
 
+![](./docs/demopic.png)
+
 A Rust implementation of Radhika Nagpal's MIT thesis,
 *"Programmable Self-Assembly: Constructing Global Shape using
 Biologically-inspired Local Interactions and Origami Mathematics"* (2001).
